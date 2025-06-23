@@ -1,158 +1,92 @@
 const std = @import("std");
-const pixman = @import("pixman");
+const ffmpeg = @import("ffmpeg");
 const cairo = @import("cairo");
-const gif = @import("gif");
+const pixman = @import("pixman");
+
 const allocator = std.heap.page_allocator;
-const GIF_ERROR = gif.GIF_ERROR;
-
-var composite_buffer: ?[]u32 = null;
-var canvas_width: usize = 0;
-var canvas_height: usize = 0;
-
-pub fn initCompositeBuffer(width: usize, height: usize) !void {
-    canvas_width = width;
-    canvas_height = height;
-    composite_buffer = try allocator.alloc(u32, width * height);
-    @memset(composite_buffer.?, 0x00000000); //check if background color will work here
-}
 
 pub fn main() !void {
-    const gifpath = "/home/noble/Pictures/wallpapers/Wonder Woman.gif";
-    var error_code: c_int = 0;
-    const file = gif.DGifOpenFileName(gifpath, &error_code) orelse return error.NoGif;
-    var RecordType: gif.GifRecordType = undefined;
-    try initCompositeBuffer(@intCast(file.*.SWidth), @intCast(file.*.SHeight));
-    var ExtFunction: c_int = undefined;
-    var ExtData: [*c]gif.GifByteType = undefined;
-    var gcb: gif.GraphicsControlBlock = undefined; //the gcb of the current image in the iteration
-    while (RecordType != gif.TERMINATE_RECORD_TYPE) {
-        _ = gif.DGifGetRecordType(file, &RecordType);
-        switch (RecordType) {
-            gif.IMAGE_DESC_RECORD_TYPE => {
-                //handle disposal modes
-                std.debug.assert(gif.DGifGetImageDesc(file) != GIF_ERROR);
-                //the current image
-                var IMAGE = &file.*.SavedImages[@as(usize, @intCast(file.*.ImageCount)) - 1];
-                const HEIGHT: usize = @intCast(IMAGE.ImageDesc.Height);
-                const WIDTH: usize = @intCast(IMAGE.ImageDesc.Width);
-                const SIZE = WIDTH * HEIGHT;
-                const FRAME_LEFT: usize = @intCast(IMAGE.ImageDesc.Left);
-                const FRAME_TOP: usize = @intCast(IMAGE.ImageDesc.Top);
-                const _rasterbits_alloc = try allocator.alloc(gif.GifByteType, SIZE);
+    var fmt_ctx: [*c]ffmpeg.AVFormatContext = null;
+    var codec_ctx: [*c]ffmpeg.AVCodecContext = null;
+    var rgb_frame: [*c]ffmpeg.AVFrame = null;
+    var frame: [*c]ffmpeg.AVFrame = null;
+    var packet: [*c]ffmpeg.AVPacket = null;
 
-                //most important part, since we dont want to store the whole image in memory and we have a composite buffer storing old pixels, we can free rasterbits
-                defer allocator.free(_rasterbits_alloc);
-                switch (gcb.DisposalMode) {
-                    0, 1 => {},
-                    2 => {
-                        for (0..HEIGHT) |v| {
-                            for (0..WIDTH) |u| {
-                                const canvas_x = FRAME_LEFT + u;
-                                const canvas_y = FRAME_TOP + v;
+    //open file
+    _ = ffmpeg.avformat_open_input(&fmt_ctx, "/home/noble/Pictures/wallpapers/preconvert/zero-two-in-water-3343.mp4", null, null);
+    _ = ffmpeg.avformat_find_stream_info(fmt_ctx, null);
+    var video_stream_index: usize = undefined;
 
-                                if (canvas_x >= canvas_width or canvas_y >= canvas_height) continue;
-
-                                const canvas_index = canvas_y * canvas_width + canvas_x;
-                                composite_buffer.?[canvas_index] = @intCast(file.*.SBackGroundColor);
-                            }
-                        }
-                    },
-                    3 => {}, //todo, or maybe not tbh
-                    else => {},
-                }
-                IMAGE.RasterBits = _rasterbits_alloc.ptr;
-                if (IMAGE.ImageDesc.Interlace) {
-                    const interlacedOffset = [_]usize{ 0, 4, 2, 1 };
-                    const interlacedJumps = [_]usize{ 8, 8, 4, 2 };
-
-                    //need to perform 4 passes
-                    for (0..4) |i| {
-                        var j = interlacedOffset[i];
-                        const end = HEIGHT;
-                        while (j < end) : (j += interlacedJumps[i]) {
-                            std.debug.assert(gif.DGifGetLine(file, IMAGE.RasterBits + j * WIDTH, IMAGE.ImageDesc.Width) != GIF_ERROR);
-                        }
-                    }
-                } else {
-                    std.debug.assert(gif.DGifGetLine(file, IMAGE.RasterBits, IMAGE.ImageDesc.Height * IMAGE.ImageDesc.Width) != GIF_ERROR);
-                }
-                if (file.*.ExtensionBlocks != null) {
-                    IMAGE.ExtensionBlocks = file.*.ExtensionBlocks;
-                    IMAGE.ExtensionBlockCount = file.*.ExtensionBlockCount;
-
-                    file.*.ExtensionBlocks = null;
-                    file.*.ExtensionBlockCount = 0;
-                }
-                std.log.debug("LOCATED A DISPOSAL MODE OF {d}", .{gcb.DisposalMode});
-                std.log.debug("LOCATED A TRANSPARENCY INDEX OF {d}", .{gcb.TransparentColor});
-                std.log.debug("LOCATED A DELAY OF {d}", .{gcb.DelayTime});
-                std.log.debug("\r\n", .{});
-                try iter(file, IMAGE, gcb);
-            },
-
-            gif.EXTENSION_RECORD_TYPE => {
-                std.debug.assert(gif.DGifGetExtension(file, &ExtFunction, &ExtData) != GIF_ERROR);
-                if (ExtFunction == gif.GRAPHICS_EXT_FUNC_CODE) {
-                    std.debug.assert(gif.DGifExtensionToGCB(ExtData[0], ExtData + 1, &gcb) != GIF_ERROR);
-                }
-                while (true) {
-                    std.debug.assert(gif.DGifGetExtensionNext(file, &ExtData) != GIF_ERROR);
-                    if (ExtData == null) break;
-                }
-            },
-
-            gif.TERMINATE_RECORD_TYPE => {
-                std.log.debug("Reached the end of file", .{});
-            },
-            else => {},
+    for (0..@intCast(fmt_ctx.*.nb_streams)) |i| {
+        if (fmt_ctx.*.streams[i].*.codecpar.*.codec_type == ffmpeg.AVMEDIA_TYPE_VIDEO) {
+            video_stream_index = i;
+            std.log.debug("Located video stream", .{});
+            break;
         }
     }
-    if (composite_buffer) |cb| {
-        allocator.free(cb);
-    }
-}
+    const _codec = ffmpeg.avcodec_find_decoder(fmt_ctx.*.streams[video_stream_index].*.codecpar.*.codec_id);
+    codec_ctx = ffmpeg.avcodec_alloc_context3(_codec);
+    _ = ffmpeg.avcodec_parameters_to_context(codec_ctx, fmt_ctx.*.streams[video_stream_index].*.codecpar);
+    _ = ffmpeg.avcodec_open2(codec_ctx, _codec, null);
 
-pub fn iter(file: [*c]gif.GifFileType, savedImage: [*c]gif.SavedImage, gcb: gif.GraphicsControlBlock) !void {
-    const colorMap = savedImage.*.ImageDesc.ColorMap orelse file.*.SColorMap;
+    frame = ffmpeg.av_frame_alloc();
+    packet = ffmpeg.av_packet_alloc();
+    rgb_frame = ffmpeg.av_frame_alloc();
 
-    const frame_width: usize = @intCast(savedImage.*.ImageDesc.Width);
-    const frame_height: usize = @intCast(savedImage.*.ImageDesc.Height);
-    const frame_left: usize = @intCast(savedImage.*.ImageDesc.Left);
-    const frame_top: usize = @intCast(savedImage.*.ImageDesc.Top);
-    const framecount: usize = @intCast(file.*.ImageCount);
-    const has_transparency = (gcb.TransparentColor != -1) and (gcb.TransparentColor >= 0);
-    const transparent_index: u8 = if (has_transparency) @intCast(gcb.TransparentColor) else 0;
+    const HEIGHT = codec_ctx.*.height;
+    const WIDTH = codec_ctx.*.width;
+    const src_pix_fmt = codec_ctx.*.pix_fmt;
 
-    //to argb32
-    for (0..frame_height) |v| {
-        for (0..frame_width) |u| {
-            const canvas_x = frame_left + u;
-            const canvas_y = frame_top + v;
-            if (canvas_x >= canvas_width or canvas_y >= canvas_height) continue;
-            const c = savedImage.*.RasterBits[v * frame_width + u];
-            const canvas_index = canvas_y * canvas_width + canvas_x;
-            if (has_transparency and c == transparent_index) {
-                continue;
-            } else {
-                const rgb = colorMap.*.Colors[c];
-                const r: u32 = @intCast(rgb.Red);
-                const g: u32 = @intCast(rgb.Green);
-                const b: u32 = @intCast(rgb.Blue);
-                const argb = 0xFF << 24 | // Full alpha
-                    r << 16 |
-                    g << 8 |
-                    b;
+    std.log.debug("Video dimensinons {d}x{d}", .{ WIDTH, HEIGHT });
 
-                composite_buffer.?[canvas_index] = argb;
+    const sws_ctx = ffmpeg.sws_getContext(
+        WIDTH,
+        HEIGHT,
+        src_pix_fmt,
+        WIDTH,
+        HEIGHT,
+        ffmpeg.AV_PIX_FMT_BGRA,
+        ffmpeg.SWS_BILINEAR,
+        null,
+        null,
+        null,
+    );
+
+    const argb_buffer_size = ffmpeg.av_image_get_buffer_size(ffmpeg.AV_PIX_FMT_ARGB, WIDTH, HEIGHT, 1);
+    const argb_buffer = try allocator.alignedAlloc(u8, @alignOf(u32), @intCast(argb_buffer_size));
+    defer allocator.free(argb_buffer);
+
+    // Setup RGB frame
+    _ = ffmpeg.av_image_fill_arrays(&rgb_frame.*.data[0], &rgb_frame.*.linesize[0], argb_buffer.ptr, ffmpeg.AV_PIX_FMT_ARGB, WIDTH, HEIGHT, 1);
+
+    var frame_count: usize = 0;
+    while (ffmpeg.av_read_frame(fmt_ctx, packet) >= 0) {
+        if (packet.*.stream_index == video_stream_index) {
+            _ = ffmpeg.avcodec_send_packet(codec_ctx, packet);
+            defer ffmpeg.av_packet_unref(packet);
+            while (ffmpeg.avcodec_receive_frame(codec_ctx, frame) == 0) {
+                frame_count += 1;
+                std.log.debug("Located frame {d}", .{frame_count});
+
+                _ = ffmpeg.sws_scale(sws_ctx, @ptrCast(&frame.*.data[0]), &frame.*.linesize[0], 0, HEIGHT, @ptrCast(&rgb_frame.*.data[0]), &rgb_frame.*.linesize[0]);
+
+                const pixel_count = @as(usize, @intCast(WIDTH * HEIGHT));
+                const argb_pixels: []u32 = std.mem.bytesAsSlice(u32, argb_buffer[0 .. pixel_count * 4]);
+                try iter(argb_pixels, WIDTH, HEIGHT, frame_count);
             }
         }
     }
+}
+
+fn iter(buffer: []u32, width: c_int, height: c_int, framecount: usize) !void {
+    // defer allocator.free(buffer);
+
     const pixman_image = pixman.Image.createBits(
         .a8r8g8b8,
-        @intCast(canvas_width),
-        @intCast(canvas_height),
-        @ptrCast(@alignCast(composite_buffer.?.ptr)),
-        @intCast(canvas_width * 4),
+        @intCast(width),
+        @intCast(height),
+        @ptrCast(@alignCast(buffer.ptr)),
+        @intCast(width * 4),
     );
     const surface = cairo.cairo_image_surface_create_for_data(
         @ptrCast(@alignCast(pixman_image.?.getData())),
@@ -161,16 +95,11 @@ pub fn iter(file: [*c]gif.GifFileType, savedImage: [*c]gif.SavedImage, gcb: gif.
         @intCast(pixman_image.?.getHeight()),
         @intCast(pixman_image.?.getStride()),
     );
+
     if (cairo.cairo_surface_status(surface) != cairo.CAIRO_STATUS_SUCCESS) {
-        std.log.err("Could not create surface", .{});
-        std.posix.exit(1);
+        std.log.err("Cpuld not create surface", .{});
     }
-    std.debug.print("Surface created", .{});
     const filename = try std.fmt.allocPrint(allocator, "frame{d}.png", .{framecount});
-    const status = cairo.cairo_surface_write_to_png(surface, @ptrCast(filename));
-    if (status != cairo.CAIRO_STATUS_SUCCESS) {
-        std.log.err("Could not write to png", .{});
-    } else {
-        std.log.debug("written to png", .{});
-    }
+    _ = cairo.cairo_surface_write_to_png(surface, @ptrCast(filename));
+    std.log.debug("surface created succeduflly", .{});
 }
